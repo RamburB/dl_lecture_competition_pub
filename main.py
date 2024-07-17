@@ -13,7 +13,19 @@ from pathlib import Path
 from typing import Dict, Any
 import os
 import time
+import torch.optim.lr_scheduler as lr_scheduler  
 
+# class CustomLRScheduler:
+#     def __init__(self, optimizer, milestones, learning_rates):
+#         self.milestones = milestones
+#         self.learning_rates = learning_rates
+#         self.last_epoch = -1
+
+#     def step(self, epoch):
+#         if epoch in self.milestones:
+#             lr = self.learning_rates[self.milestones.index(epoch)]
+#             for param_group in optimizer.param_groups:
+#                 param_group['lr'] = lr
 
 class RepresentationType(Enum):
     VOXEL = auto()
@@ -27,14 +39,29 @@ def set_seed(seed):
     torch.backends.cudnn.benchmark = False
     np.random.seed(seed)
 
-def compute_epe_error(pred_flow: torch.Tensor, gt_flow: torch.Tensor):
+# def compute_epe_error(pred_flow: torch.Tensor, gt_flow: torch.Tensor):
+#     '''
+#     end-point-error (ground truthと予測値の二乗誤差)を計算
+#     pred_flow: torch.Tensor, Shape: torch.Size([B, 2, 480, 640]) => 予測したオプティカルフローデータ
+#     gt_flow: torch.Tensor, Shape: torch.Size([B, 2, 480, 640]) => 正解のオプティカルフローデータ
+#     '''
+#     epe = torch.mean(torch.mean(torch.norm(pred_flow - gt_flow, p=2, dim=1), dim=(1, 2)), dim=0)
+#     return epe
+
+def compute_epe_error(pred_flow: torch.Tensor, gt_flow: torch.Tensor, model: torch.nn.Module, lambda_l2: float):
     '''
     end-point-error (ground truthと予測値の二乗誤差)を計算
     pred_flow: torch.Tensor, Shape: torch.Size([B, 2, 480, 640]) => 予測したオプティカルフローデータ
     gt_flow: torch.Tensor, Shape: torch.Size([B, 2, 480, 640]) => 正解のオプティカルフローデータ
+    model: torch.nn.Module => モデル（L2正則化のために使用）
+    lambda_l2: float => L2正則化の重み
     '''
-    epe = torch.mean(torch.mean(torch.norm(pred_flow - gt_flow, p=2, dim=1), dim=(1, 2)), dim=0)
-    return epe
+    epe = torch.mean(torch.norm(pred_flow - gt_flow, p=2, dim=1))  # ここを修正
+    l2_reg = sum(torch.norm(param, 2) for param in model.parameters())
+    loss = epe + lambda_l2 * l2_reg
+    return loss
+
+
 
 def save_optical_flow_to_npy(flow: torch.Tensor, file_name: str):
     '''
@@ -117,18 +144,33 @@ def main(args: DictConfig):
     # ------------------
     optimizer = torch.optim.Adam(model.parameters(), lr=args.train.initial_learning_rate, weight_decay=args.train.weight_decay)
     # ------------------
+    #   Scheduler
+    # ------------------
+    # CustomLRScheduler クラス作成
+    # milestones = [1, 11, 19]
+    # learning_rates = [0.001, 0.0001,0.00001]
+    # scheduler = CustomLRScheduler(optimizer,milestones,learning_rates)
+    # StepLR スケジューラを追加
+    scheduler = lr_scheduler.StepLR(optimizer, step_size=args.scheduler.step_size, gamma=args.scheduler.gamma)
+    # ------------------
     #   Start training
     # ------------------
     model.train()
     for epoch in range(args.train.epochs):
         total_loss = 0
         print("on epoch: {}".format(epoch+1))
+        
+        # # 現在の学習率を表示
+        # current_lr = optimizer.param_groups[0]['lr']
+        # print(f"エポック {epoch+1}/{args.train.epochs}, 学習率: {current_lr}")
+        
         for i, batch in enumerate(tqdm(train_data)):
             batch: Dict[str, Any]
             event_image = batch["event_volume"].to(device) # [B, 4, 480, 640]
             ground_truth_flow = batch["flow_gt"].to(device) # [B, 2, 480, 640]
             flow = model(event_image) # [B, 2, 480, 640]
-            loss: torch.Tensor = compute_epe_error(flow, ground_truth_flow)
+            # loss: torch.Tensor = compute_epe_error(flow, ground_truth_flow)
+            loss: torch.Tensor = compute_epe_error(flow, ground_truth_flow, model, args.train.lambda_l2)
             print(f"batch {i} loss: {loss.item()}")
             optimizer.zero_grad()
             loss.backward()
@@ -136,6 +178,9 @@ def main(args: DictConfig):
 
             total_loss += loss.item()
         print(f'Epoch {epoch+1}, Loss: {total_loss / len(train_data)}')
+
+        # エポックごとにスケジューラをステップ
+        scheduler.step()
 
     # Create the directory if it doesn't exist
     if not os.path.exists('checkpoints'):
